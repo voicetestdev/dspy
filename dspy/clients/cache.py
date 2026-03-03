@@ -4,7 +4,7 @@ import logging
 import threading
 from functools import wraps
 from hashlib import sha256
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 import cloudpickle
 import orjson
@@ -13,6 +13,29 @@ from cachetools import LRUCache
 from diskcache import FanoutCache
 
 logger = logging.getLogger(__name__)
+
+
+@runtime_checkable
+class CacheBackend(Protocol):
+    """Protocol for pluggable cache backends.
+
+    Any object implementing ``__contains__``, ``__getitem__``, and
+    ``__setitem__`` (i.e. a dict-like interface) can serve as a drop-in
+    replacement for the default ``diskcache.FanoutCache`` used by DSPy.
+
+    Example::
+
+        class MyBackend:
+            def __contains__(self, key: str) -> bool: ...
+            def __getitem__(self, key: str) -> Any: ...
+            def __setitem__(self, key: str, value: Any) -> None: ...
+
+        dspy.configure_cache(disk_cache_backend=MyBackend())
+    """
+
+    def __contains__(self, key: str) -> bool: ...
+    def __getitem__(self, key: str) -> Any: ...
+    def __setitem__(self, key: str, value: Any) -> None: ...
 
 
 class Cache:
@@ -30,6 +53,7 @@ class Cache:
         disk_cache_dir: str,
         disk_size_limit_bytes: int | None = 1024 * 1024 * 10,
         memory_max_entries: int = 1000000,
+        disk_cache_backend: CacheBackend | None = None,
     ):
         """
         Args:
@@ -38,9 +62,12 @@ class Cache:
             disk_cache_dir: The directory where the disk cache is stored.
             disk_size_limit_bytes: The maximum size of the disk cache (in bytes).
             memory_max_entries: The maximum size of the in-memory cache (in number of items).
+            disk_cache_backend: An optional custom backend satisfying the :class:`CacheBackend`
+                protocol.  When provided this object is used as the persistent cache layer instead
+                of the default ``diskcache.FanoutCache``, and ``enable_disk_cache`` is forced to
+                ``True``.
         """
 
-        self.enable_disk_cache = enable_disk_cache
         self.enable_memory_cache = enable_memory_cache
         if self.enable_memory_cache:
             if memory_max_entries is None:
@@ -50,7 +77,12 @@ class Cache:
             self.memory_cache = LRUCache(maxsize=memory_max_entries)
         else:
             self.memory_cache = {}
-        if self.enable_disk_cache:
+
+        if disk_cache_backend is not None:
+            self.enable_disk_cache = True
+            self.disk_cache = disk_cache_backend
+        elif enable_disk_cache:
+            self.enable_disk_cache = True
             self.disk_cache = FanoutCache(
                 shards=16,
                 timeout=10,
@@ -58,6 +90,7 @@ class Cache:
                 size_limit=disk_size_limit_bytes,
             )
         else:
+            self.enable_disk_cache = False
             self.disk_cache = {}
 
         self._lock = threading.RLock()
@@ -100,7 +133,6 @@ class Cache:
         return sha256(orjson.dumps(params, option=orjson.OPT_SORT_KEYS)).hexdigest()
 
     def get(self, request: dict[str, Any], ignored_args_for_cache_key: list[str] | None = None) -> Any:
-
         if not self.enable_memory_cache and not self.enable_disk_cache:
             return None
 
@@ -176,8 +208,10 @@ class Cache:
 
     def load_memory_cache(self, filepath: str, allow_pickle: bool = False) -> None:
         if not allow_pickle:
-            raise ValueError("Loading untrusted .pkl files can run arbitrary code, which may be dangerous. \
-            Set `allow_pickle=True` to load if you are running in a trusted environment and the file is from a trusted source.")
+            raise ValueError(
+                "Loading untrusted .pkl files can run arbitrary code, which may be dangerous. \
+            Set `allow_pickle=True` to load if you are running in a trusted environment and the file is from a trusted source."
+            )
 
         if not self.enable_memory_cache:
             return

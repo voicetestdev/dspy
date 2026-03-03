@@ -369,3 +369,173 @@ def test_cache_fallback_on_restricted_environment():
             os.environ.pop("DSPY_CACHEDIR", None)
         else:
             os.environ["DSPY_CACHEDIR"] = old_env
+
+
+# ---- Pluggable cache backend tests ----
+
+
+class DictBackend(dict):
+    """Minimal dict-like backend for testing the pluggable cache interface."""
+
+    pass
+
+
+class FailingBackend:
+    """Backend that raises on every operation, for testing graceful degradation."""
+
+    def __contains__(self, key):
+        raise ConnectionError("simulated network failure")
+
+    def __getitem__(self, key):
+        raise ConnectionError("simulated network failure")
+
+    def __setitem__(self, key, value):
+        raise ConnectionError("simulated network failure")
+
+
+def test_cache_backend_protocol_exists():
+    """CacheBackend protocol should be importable from dspy.clients.cache."""
+    from dspy.clients.cache import CacheBackend
+
+    assert hasattr(CacheBackend, "__contains__")
+    assert hasattr(CacheBackend, "__getitem__")
+    assert hasattr(CacheBackend, "__setitem__")
+
+
+def test_cache_backend_protocol_runtime_checkable():
+    """DictBackend should satisfy the CacheBackend protocol at runtime."""
+    from dspy.clients.cache import CacheBackend
+
+    backend = DictBackend()
+    assert isinstance(backend, CacheBackend)
+
+
+def test_cache_accepts_custom_disk_backend(tmp_path):
+    """Cache should accept a disk_cache_backend parameter and use it as disk_cache."""
+    backend = DictBackend()
+    cache = Cache(
+        enable_disk_cache=True,
+        enable_memory_cache=True,
+        disk_cache_dir=str(tmp_path),
+        disk_size_limit_bytes=1024,
+        memory_max_entries=100,
+        disk_cache_backend=backend,
+    )
+    assert cache.disk_cache is backend
+
+
+def test_custom_backend_skips_fanout_cache(tmp_path):
+    """When disk_cache_backend is provided, no FanoutCache should be created."""
+    backend = DictBackend()
+    cache = Cache(
+        enable_disk_cache=True,
+        enable_memory_cache=False,
+        disk_cache_dir=str(tmp_path),
+        disk_size_limit_bytes=1024,
+        memory_max_entries=100,
+        disk_cache_backend=backend,
+    )
+    assert not isinstance(cache.disk_cache, FanoutCache)
+    assert cache.disk_cache is backend
+
+
+def test_custom_backend_enables_disk_cache_flag(tmp_path):
+    """Providing disk_cache_backend should force enable_disk_cache=True."""
+    backend = DictBackend()
+    cache = Cache(
+        enable_disk_cache=False,
+        enable_memory_cache=True,
+        disk_cache_dir=str(tmp_path),
+        disk_size_limit_bytes=0,
+        memory_max_entries=100,
+        disk_cache_backend=backend,
+    )
+    assert cache.enable_disk_cache is True
+    assert cache.disk_cache is backend
+
+
+def test_custom_backend_put_and_get(tmp_path):
+    """Full round-trip: put via Cache, get via Cache, data lives in the custom backend."""
+    backend = DictBackend()
+    cache = Cache(
+        enable_disk_cache=True,
+        enable_memory_cache=False,
+        disk_cache_dir=str(tmp_path),
+        disk_size_limit_bytes=0,
+        memory_max_entries=0,
+        disk_cache_backend=backend,
+    )
+    request = {"prompt": "hello", "model": "test-model"}
+    value = DummyResponse(message="world", usage={"tokens": 5})
+
+    cache.put(request, value)
+
+    key = cache.cache_key(request)
+    assert key in backend, "Value should be stored in the custom backend"
+
+    result = cache.get(request)
+    assert result.message == "world"
+    assert result.usage == {}  # usage cleared on cache hit
+    assert result.cache_hit is True
+
+
+def test_custom_backend_contains_check(tmp_path):
+    """__contains__ on Cache should delegate to the custom backend."""
+    backend = DictBackend()
+    cache = Cache(
+        enable_disk_cache=True,
+        enable_memory_cache=False,
+        disk_cache_dir=str(tmp_path),
+        disk_size_limit_bytes=0,
+        memory_max_entries=0,
+        disk_cache_backend=backend,
+    )
+    request = {"prompt": "check", "model": "test"}
+    key = cache.cache_key(request)
+
+    assert key not in cache
+    backend[key] = "stored"
+    assert key in cache
+
+
+def test_custom_backend_write_failure_is_graceful(tmp_path):
+    """If the custom backend raises on __setitem__, put() should log and not raise."""
+    cache = Cache(
+        enable_disk_cache=True,
+        enable_memory_cache=True,
+        disk_cache_dir=str(tmp_path),
+        disk_size_limit_bytes=0,
+        memory_max_entries=100,
+        disk_cache_backend=FailingBackend(),
+    )
+    request = {"prompt": "fail-write", "model": "test"}
+
+    # Should not raise — disk write failures are caught
+    cache.put(request, "some-value")
+
+    # Memory cache should still work
+    result = cache.get(request)
+    assert result == "some-value"
+
+
+def test_configure_cache_with_backend(tmp_path):
+    """configure_cache() should accept disk_cache_backend and wire it in."""
+    from dspy.clients import configure_cache
+
+    backend = DictBackend()
+    configure_cache(
+        enable_disk_cache=True,
+        enable_memory_cache=True,
+        disk_cache_dir=str(tmp_path),
+        disk_cache_backend=backend,
+    )
+
+    import dspy
+
+    assert dspy.cache.disk_cache is backend
+
+    # Verify it works end-to-end
+    request = {"prompt": "configure-test", "model": "test"}
+    dspy.cache.put(request, "configured-value")
+    result = dspy.cache.get(request)
+    assert result == "configured-value"

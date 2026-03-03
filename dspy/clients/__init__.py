@@ -5,7 +5,7 @@ from pathlib import Path
 import litellm
 
 from dspy.clients.base_lm import BaseLM, inspect_history
-from dspy.clients.cache import Cache
+from dspy.clients.cache import Cache, CacheBackend
 from dspy.clients.embedding import Embedder
 from dspy.clients.lm import LM
 from dspy.clients.provider import Provider, TrainingJob
@@ -22,6 +22,7 @@ def configure_cache(
     disk_cache_dir: str | None = DISK_CACHE_DIR,
     disk_size_limit_bytes: int | None = DISK_CACHE_LIMIT,
     memory_max_entries: int = 1000000,
+    disk_cache_backend: CacheBackend | None = None,
 ):
     """Configure the cache for DSPy.
 
@@ -32,6 +33,9 @@ def configure_cache(
         disk_size_limit_bytes: The size limit of the on-disk cache.
         memory_max_entries: The maximum number of entries in the in-memory cache. To allow the cache to grow without
                             bounds, set this parameter to `math.inf` or a similar value.
+        disk_cache_backend: An optional custom backend satisfying the :class:`CacheBackend`
+            protocol.  When provided this object is used instead of the default
+            ``diskcache.FanoutCache``.
     """
 
     DSPY_CACHE = Cache(
@@ -40,6 +44,7 @@ def configure_cache(
         disk_cache_dir,
         disk_size_limit_bytes,
         memory_max_entries,
+        disk_cache_backend=disk_cache_backend,
     )
 
     import dspy
@@ -111,6 +116,7 @@ disable_litellm_logging()
 
 __all__ = [
     "BaseLM",
+    "CacheBackend",
     "LM",
     "Provider",
     "TrainingJob",
